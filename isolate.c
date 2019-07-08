@@ -60,6 +60,15 @@ static int cmd_exec(void *arg)
     // Wait for 'setup done' signal from the main process.
     await_setup(params->fd[0]);
 
+    // Assuming, 0 in the current namespace maps to
+    // a non-privileged UID in the parent namespace,
+    // drop superuser privileges if any by enforcing
+    // the exec'ed process runs with UID 0.
+    if (setgid(0) == -1)
+        die("Failed to setgid: %m\n");
+    if (setuid(0) == -1)
+        die("Failed to setuid: %m\n");
+
     char **argv = params->argv;
     char *cmd = argv[0];
     printf("===========%s============\n", cmd);
@@ -69,6 +78,43 @@ static int cmd_exec(void *arg)
 
     die("¯\\_(ツ)_/¯");
     return 1;
+}
+
+static void write_file(char path[100], char line[100])
+{
+    FILE *f = fopen(path, "w");
+
+    if (f == NULL) {
+        die("Failed to open file %s: %m\n", path);
+    }
+
+    if (fwrite(line, 1, strlen(line), f) < 0) {
+        die("Failed to write to file %s:\n", path);
+    }
+
+    if (fclose(f) != 0) {
+        die("Failed to close file %s: %m\n", path);
+    }
+}
+
+static void prepare_userns(int pid)
+{
+    char path[100];
+    char line[100];
+
+    int uid = 1000;
+
+    sprintf(path, "/proc/%d/uid_map", pid);
+    sprintf(line, "0 %d 1\n", uid);
+    write_file(path, line);
+
+    sprintf(path, "/proc/%d/setgroups", pid);
+    sprintf(line, "deny");
+    write_file(path, line);
+
+    sprintf(path, "/proc/%d/gid_map", pid);
+    sprintf(line, "0 %d 1\n", uid);
+    write_file(path, line);
 }
 
 int main(int argc, char **argv)
@@ -88,7 +134,7 @@ int main(int argc, char **argv)
             // if the command process exits, it leaves an exit status
             // so that we can reap it.
             SIGCHLD |
-            CLONE_NEWUTS;
+            CLONE_NEWUTS | CLONE_NEWUSER;
     int cmd_pid = clone(
         cmd_exec, cmd_stack + STACKSIZE, clone_flags, &params);
 
@@ -99,6 +145,7 @@ int main(int argc, char **argv)
     int pipe = params.fd[1];
 
     // Some namespace setup will take place here ...
+    prepare_userns(cmd_pid);
 
     // Signal to the command process we're done with setup.
     if (write(pipe, "OK", 2) != 2)
